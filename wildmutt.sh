@@ -1,15 +1,16 @@
 #!/bin/bash
-# Wildmutt v2.0 - Advanced JavaScript Secret Scanner
-# By: [Seu Nome]
-# Desc: Scans for exposed secrets in JavaScript files with enhanced capabilities
+# Wildmutt v2.2 - Enhanced JavaScript Secret Scanner
+# By: [GOUD3REN]
+# Desc: Scans for exposed secrets with advanced path normalization and wordlist handling
 
 # Configurações
-USER_AGENT="Wildmutt/2.0 (Secret Scanner)"
+USER_AGENT="Wildmutt/2.2 (Secret Scanner)"
 TIMEOUT=15
 PATTERNS_FILE="wildmutt_patterns.txt"
 DEFAULT_PATTERNS="api[_-]?key|aws[_-]?secret|password|token|secret|ftp|db|sql|oauth|credential|access[_-]?key|auth[_-]?key|client[_-]?secret|encryption[_-]?key|private[_-]?key"
 MAX_THREADS=10
 CRAWL_DEPTH=1
+PATH_CHAR_LIMIT=250  # Limite para evitar caminhos inválidos
 
 # Cores
 RED='\033[0;31m'
@@ -22,6 +23,8 @@ NC='\033[0m'
 # Variáveis globais
 declare -a JS_URLS
 declare -A VISITED_URLS
+CHECK_VALIDITY=false
+VERBOSE=false
 
 show_banner() {
     echo -e "${CYAN}"
@@ -32,7 +35,7 @@ show_banner() {
     echo "  \__/\  / |__/_____ \  \  |__| |____/(____  /____/"
     echo "       \/           \/   \/                \/      "
     echo -e "${NC}"
-    echo -e "${YELLOW}Wildmutt v2.0 - JavaScript Secret Hunter${NC}"
+    echo -e "${YELLOW}Wildmutt v2.2 - JavaScript Secret Hunter${NC}"
     echo -e "${YELLOW}----------------------------------------${NC}"
 }
 
@@ -47,7 +50,7 @@ help() {
     echo "  -o  Salvar resultados em arquivo (opcional)"
     echo "  -t  Número de threads (padrão: 10)"
     echo "  -d  Profundidade de crawling (padrão: 1)"
-    echo "  -c  Verificar validade de chaves encontradas (experimental)"
+    echo "  -c  Verificar validade de chaves encontradas"
     echo "  -v  Modo verboso"
     echo "  -h  Mostrar esta ajuda"
     exit 0
@@ -78,6 +81,27 @@ fetch_url() {
 
 get_status() {
     curl -s -o /dev/null -w "%{http_code}" -A "$USER_AGENT" --max-time "$TIMEOUT" -L "$1" 2>/dev/null
+}
+
+normalize_path() {
+    local path="$1"
+    
+    # 1. Remover caracteres problemáticos
+    path=$(echo "$path" | sed 's/[][()*^$+?{|}\\]//g')
+    
+    # 2. Remover padrões de regex acidentais no início
+    path=$(echo "$path" | sed 's/^\/[a-z],$//i')
+    
+    # 3. Garantir que comece com barra
+    [[ "$path" =~ ^/ ]] || path="/$path"
+    
+    # 4. Remover múltiplas barras consecutivas
+    path=$(echo "$path" | sed 's|//\+|/|g')
+    
+    # 5. Remover espaços em branco
+    path=$(echo "$path" | awk '{$1=$1};1')
+    
+    echo "$path"
 }
 
 scan_js() {
@@ -128,6 +152,10 @@ validate_secrets() {
         if [[ $secret =~ AKIA[0-9A-Z]{16} ]]; then
             echo -e "${RED}[!] ATENÇÃO: Possível AWS Access Key encontrada${NC}"
         fi
+        
+        if [[ $secret =~ [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12} ]]; then
+            echo -e "${BLUE}[*] Possível UUID encontrado${NC}"
+        fi
     done <<< "$secrets"
 }
 
@@ -140,7 +168,7 @@ discover_resources() {
     [ -n "${VISITED_URLS[$url]}" ] && return
     VISITED_URLS["$url"]=1
 
-    echo -e "${YELLOW}[*] Crawling: $url (Profundidade $depth)${NC}"
+    [ "$VERBOSE" = true ] && echo -e "${YELLOW}[*] Crawling: $url (Profundidade $depth)${NC}"
     content=$(fetch_url "$url")
     [ -z "$content" ] && return
 
@@ -150,7 +178,11 @@ discover_resources() {
     for new_url in "${new_urls[@]}"; do
         # Converter URL relativa
         if [[ ! "$new_url" =~ ^https?:// ]]; then
-            new_url="${url%/}/$new_url"
+            if [[ "$new_url" == /* ]]; then
+                new_url="${TARGET_URL%%/}$new_url"
+            else
+                new_url="${url%/}/$new_url"
+            fi
         fi
         
         # Adicionar à lista se for JS e não visitado
@@ -170,39 +202,72 @@ main() {
     
     # Wordlist discovery
     if [ -n "$WORDLIST" ]; then
-        echo -e "${YELLOW}[*] Testando wordlist: $WORDLIST${NC}"
-        while read -r path; do
-            # Construir URL
-            if [[ "$path" == /* ]]; then
-                test_url="${TARGET_URL%/}$path"
-            else
-                test_url="${TARGET_URL%/}/$path"
+        echo -e "${YELLOW}[*] Processando wordlist: $WORDLIST${NC}"
+        local total_lines=$(wc -l < "$WORDLIST")
+        local count=0
+        local valid_paths=0
+        
+        while read -r raw_path; do
+            ((count++))
+            [ "$VERBOSE" = true ] && echo -e "${BLUE}[*] Processando ($count/$total_lines): $raw_path${NC}"
+            
+            # 1. Filtrar caminhos inválidos
+            if [ -z "$raw_path" ] || [ "${#raw_path}" -gt "$PATH_CHAR_LIMIT" ]; then
+                [ "$VERBOSE" = true ] && echo -e "${YELLOW}[-] Caminho inválido ignorado${NC}"
+                continue
             fi
             
-            # Verificar se já foi processado
-            [ -n "${VISITED_URLS[$test_url]}" ] && continue
+            # 2. Normalizar caminho
+            path=$(normalize_path "$raw_path")
             
-            # Verificar existência
+            # 3. Verificar se ainda é válido após normalização
+            if [ -z "$path" ] || [ "$path" = "/" ] || [[ "$path" =~ ^/([a-z],)?$ ]]; then
+                [ "$VERBOSE" = true ] && echo -e "${YELLOW}[-] Caminho ignorado após normalização${NC}"
+                continue
+            fi
+            
+            # 4. Construir URL
+            if [[ "$path" == /* ]]; then
+                test_url="${TARGET_URL%%/}$path"
+            else
+                test_url="${TARGET_URL%%/}/$path"
+            fi
+            
+            # 5. Verificar se já foi processado
+            if [ -n "${VISITED_URLS[$test_url]}" ]; then
+                [ "$VERBOSE" = true ] && echo -e "${YELLOW}[-] URL já visitada: $test_url${NC}"
+                continue
+            fi
+            
+            # 6. Verificar existência
             status=$(get_status "$test_url")
             if [ "$status" -eq 200 ]; then
                 JS_URLS+=("$test_url")
-                echo -e "${GREEN}[+] Novo recurso encontrado: $test_url${NC}"
+                ((valid_paths++))
+                echo -e "${GREEN}[+] Recurso encontrado ($valid_paths): $test_url${NC}"
                 discover_resources "$test_url" 0
+            elif [ "$VERBOSE" = true ]; then
+                echo -e "${YELLOW}[-] Recurso não encontrado ($status): $test_url${NC}"
             fi
         done < "$WORDLIST"
+        
+        echo -e "${GREEN}[+] Total de caminhos válidos na wordlist: $valid_paths/${total_lines}${NC}"
     fi
     
-    # Processar URLs
-    local count=0
-    echo -e "${GREEN}[+] Total de recursos para escanear: ${#JS_URLS[@]}${NC}"
+    # Remover duplicados
+    mapfile -t JS_URLS < <(printf "%s\n" "${JS_URLS[@]}" | sort -u)
     
+    # Escanear recursos
+    local total_resources=${#JS_URLS[@]}
+    echo -e "${GREEN}[+] Total de recursos para escanear: $total_resources${NC}"
+    
+    local count=0
     for js_url in "${JS_URLS[@]}"; do
         if [ "$VERBOSE" = true ]; then
-            echo -e "${YELLOW}[*] Analisando: $js_url${NC}"
+            echo -e "${YELLOW}[*] Analisando ($((++count))/$total_resources): $js_url${NC}"
         fi
         
         scan_js "$js_url" &
-        ((count++))
         
         # Controle de threads
         if ((count % MAX_THREADS == 0)); then
@@ -214,7 +279,7 @@ main() {
 
 # Inicialização
 show_banner
-while getopts "u:w:p:o:t:d:c:vh" opt; do
+while getopts "u:w:p:o:t:d:cvh" opt; do
     case $opt in
         u) TARGET_URL="$OPTARG";;
         w) WORDLIST="$OPTARG";;
